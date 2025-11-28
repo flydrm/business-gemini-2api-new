@@ -203,6 +203,45 @@
             background: var(--danger);
         }
 
+        .cooldown-hint {
+            display: block;
+            color: var(--text-muted);
+            font-size: 12px;
+            margin-top: 4px;
+        }
+
+        .log-level-control {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: var(--card-bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius-md);
+            padding: 6px 10px;
+        }
+        .log-level-control label {
+            font-size: 12px;
+            color: var(--text-muted);
+        }
+        .log-level-select {
+            border: 1px solid var(--border);
+            background: var(--input-bg);
+            color: var(--text-main);
+            border-radius: var(--radius-sm);
+            padding: 6px 8px;
+        }
+
+        .token-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            margin-bottom: 12px;
+        }
+        .token-input {
+            flex: 1;
+            min-width: 240px;
+        }
+
         .badge-warning {
             background: var(--warning-light);
             color: #b06000;
@@ -521,6 +560,7 @@
         <symbol id="icon-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></symbol>
         <symbol id="icon-pause" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></symbol>
         <symbol id="icon-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></symbol>
+        <symbol id="icon-key" viewBox="0 0 24 24"><path d="M21 2l-2 2"></path><path d="M9 6l-2 2"></path><circle cx="7.5" cy="15.5" r="5.5"></circle><path d="M21 2l-9.6 9.6"></path><path d="M15.5 7.5l3 3"></path><path d="M16 13l-3-3"></path></symbol>
     </svg>
 
     <div class="container">
@@ -532,6 +572,15 @@
             </div>
             <div class="header-right">
                 <div class="status-indicator" id="serviceStatus">服务运行中</div>
+                <div class="log-level-control">
+                    <label for="logLevelSelect">日志</label>
+                    <select id="logLevelSelect" class="log-level-select" onchange="updateLogLevel(this.value)">
+                        <option value="DEBUG">DEBUG</option>
+                        <option value="INFO" selected>INFO</option>
+                        <option value="ERROR">ERROR</option>
+                    </select>
+                </div>
+                <button class="btn btn-outline" id="loginButton" style="padding: 8px 12px;" onclick="showLoginModal()">登录</button>
                 <a href="chat_history.html" class="btn btn-primary" style="padding: 8px 16px; font-size: 14px; text-decoration: none; display: flex; align-items: center; gap: 6px;" title="进入在线对话">
                     <svg class="icon" style="width: 16px; height: 16px;"><use xlink:href="#icon-message"></use></svg>
                     在线对话
@@ -557,6 +606,10 @@
             <button class="tab" onclick="switchTab('settings')">
                 <svg class="icon tab-icon"><use xlink:href="#icon-settings"></use></svg>
                 系统设置
+            </button>
+            <button class="tab" onclick="switchTab('tokens')">
+                <svg class="icon tab-icon"><use xlink:href="#icon-key"></use></svg>
+                Token 管理
             </button>
         </div>
 
@@ -729,6 +782,34 @@
                 </div>
             </div>
         </div>
+
+        <!-- Token 管理 -->
+        <div id="tokens" class="tab-content">
+            <div class="card">
+                <div class="card-header" style="display:flex; justify-content:space-between; align-items:center;">
+                    <div class="card-title" style="display:flex; align-items:center; gap:8px;">
+                        <svg class="icon card-title-icon"><use xlink:href="#icon-key"></use></svg>
+                        Token 管理
+                    </div>
+                    <div class="token-actions">
+                        <input id="manualToken" class="form-input token-input" placeholder="手动输入 Token（留空自动生成）">
+                        <button class="btn btn-outline" type="button" onclick="generateToken()">生成 Token</button>
+                        <button class="btn btn-primary" type="button" onclick="addToken()">添加 Token</button>
+                    </div>
+                </div>
+                <table class="table">
+                    <thead>
+                        <tr>
+                            <th style="width:70%;">Token</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tokensTableBody">
+                        <tr><td colspan="2" class="empty-state">加载中...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
     </div>
 
     <!-- 模态框 (已优化关闭按钮) -->
@@ -740,6 +821,14 @@
             </div>
             <!-- Modal Body and Footer ... (No functional changes needed) -->
             <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label" for="newAccountJson">粘贴账号JSON（可直接复制工具输出）</label>
+                    <textarea class="form-textarea" id="newAccountJson" placeholder='{"team_id":"...","secure_c_ses":"...","host_c_oses":"...","csesidx":"...","user_agent":"..."}' rows="4"></textarea>
+                    <div style="display:flex; gap:8px; margin-top:8px;">
+                        <button class="btn btn-outline btn-sm" type="button" onclick="parseAccountJson()">解析填充</button>
+                        <button class="btn btn-outline btn-sm" type="button" onclick="pasteAccountJson()">从剪贴板读取并填充</button>
+                    </div>
+                </div>
                 <div class="form-group">
                     <label class="form-label" for="newTeamId">Team ID</label>
                     <input type="text" class="form-input" id="newTeamId" placeholder="输入Team ID">
@@ -840,6 +929,27 @@
             <div class="modal-footer">
                 <button class="btn btn-outline" onclick="closeModal('addModelModal')">取消</button>
                 <button class="btn btn-primary" onclick="saveNewModel()">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 登录模态框 -->
+    <div class="modal" id="loginModal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>管理员登录</h3>
+                <button class="modal-close" onclick="closeModal('loginModal')" title="关闭">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label" for="loginPassword">后台密码</label>
+                    <input type="password" class="form-input" id="loginPassword" placeholder="输入后台密码">
+                </div>
+                <p class="text-muted" style="font-size: 12px;">首次登录将设置当前密码为后台密码。</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-outline" onclick="closeModal('loginModal')">取消</button>
+                <button class="btn btn-primary" onclick="submitLogin()">登录</button>
             </div>
         </div>
     </div>
@@ -946,12 +1056,15 @@
         let configData = {};
         let currentEditAccountId = null;
         let currentEditModelId = null;
+        const ADMIN_TOKEN_KEY = 'admin_token';
+        let tokensData = [];
 
         // --- 初始化 ---
         document.addEventListener('DOMContentLoaded', () => {
             initTheme();
             loadAllData();
             setInterval(checkServerStatus, 30000); // 每30秒检查一次服务状态
+            updateLoginButton();
         });
 
         // --- 核心加载与渲染 ---
@@ -960,8 +1073,45 @@
                 loadAccounts(),
                 loadModels(),
                 loadConfig(),
-                checkServerStatus()
+                checkServerStatus(),
+                loadLogLevel(),
+                loadTokens()
             ]);
+        }
+
+        function getAuthHeaders() {
+            const token = localStorage.getItem(ADMIN_TOKEN_KEY);
+            return token ? { 'X-Admin-Token': token } : {};
+        }
+
+        function updateLoginButton() {
+            const token = localStorage.getItem(ADMIN_TOKEN_KEY);
+            const btn = document.getElementById('loginButton');
+            if (!btn) return;
+            if (token) {
+                btn.textContent = '注销';
+                btn.disabled = false;
+                btn.classList.remove('btn-disabled');
+                btn.title = '注销登录';
+                btn.onclick = logoutAdmin;
+            } else {
+                btn.textContent = '登录';
+                btn.disabled = false;
+                btn.classList.remove('btn-disabled');
+                btn.title = '管理员登录';
+                btn.onclick = showLoginModal;
+            }
+        }
+
+        async function apiFetch(url, options = {}) {
+            const headers = Object.assign({}, options.headers || {}, getAuthHeaders());
+            const res = await fetch(url, { ...options, headers });
+            if (res.status === 401 || res.status === 403) {
+                showLoginModal();
+                updateLoginButton();
+                throw new Error('需要登录');
+            }
+            return res;
         }
 
         // --- 主题控制 ---
@@ -996,13 +1146,13 @@
             const indicator = document.getElementById('serviceStatus');
             if (!indicator) return;
             try {
-                const res = await fetch(`${API_BASE}/api/status`);
+                const res = await apiFetch(`${API_BASE}/api/status`);
                 console.log('Server Status Response:', res);
-                if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
-                const data = await res.json();
-                indicator.textContent = '服务运行中';
-                indicator.classList.remove('offline');
-                indicator.title = '服务连接正常 - ' + new Date().toLocaleString();
+            if (!res.ok) throw new Error(`HTTP error! status: ${res.status}`);
+            const data = await res.json();
+            indicator.textContent = '服务运行中';
+            indicator.classList.remove('offline');
+            indicator.title = '服务连接正常 - ' + new Date().toLocaleString();
             } catch (e) {
                 indicator.textContent = '服务离线';
                 indicator.classList.add('offline');
@@ -1013,7 +1163,7 @@
         // --- 账号管理 (Accounts) ---
         async function loadAccounts() {
             try {
-                const res = await fetch(`${API_BASE}/api/accounts`);
+                const res = await apiFetch(`${API_BASE}/api/accounts`);
                 const data = await res.json();
                 accountsData = data.accounts || [];
                 document.getElementById('currentIndex').textContent = data.current_index || 0;
@@ -1041,7 +1191,10 @@
                     <td>${index + 1}</td>
                     <td><code>${acc.team_id || '-'}</code></td>
                     <td title="${acc.user_agent}">${acc.user_agent ? acc.user_agent.substring(0, 30) + '...' : '-'}</td>
-                    <td><span class="badge ${acc.available ? 'badge-success' : 'badge-danger'}">${acc.available ? '可用' : '不可用'}</span></td>
+                    <td>
+                        <span class="badge ${acc.available ? 'badge-success' : 'badge-danger'}">${acc.available ? '可用' : '不可用'}</span>
+                        ${renderNextRefresh(acc)}
+                    </td>
                     <td style="white-space: nowrap;">
                         <button class="btn btn-sm ${acc.enabled !== false ? 'btn-warning' : 'btn-success'} btn-icon" onclick="toggleAccount(${acc.id})" title="${acc.enabled !== false ? '停用' : '启用'}"><svg class="icon" style="width:16px; height:16px;"><use xlink:href="#icon-${acc.enabled !== false ? 'pause' : 'play'}"></use></svg></button>
                         <button class="btn btn-sm btn-outline btn-icon" onclick="testAccount(${acc.id})" title="测试连接"><svg class="icon" style="width:16px; height:16px;"><use xlink:href="#icon-zap"></use></svg></button>
@@ -1056,6 +1209,20 @@
             document.getElementById('totalAccounts').textContent = accountsData.length;
             document.getElementById('availableAccounts').textContent = accountsData.filter(a => a.available).length;
             document.getElementById('unavailableAccounts').textContent = accountsData.length - accountsData.filter(a => a.available).length;
+        }
+
+        function renderNextRefresh(acc) {
+            if (!acc || !acc.cooldown_until) return '';
+            const now = Date.now();
+            const ts = acc.cooldown_until * 1000;
+            if (ts <= now) return '';
+            const next = new Date(ts);
+            const remaining = Math.max(0, ts - now);
+            const minutes = Math.floor(remaining / 60000);
+            const label = minutes >= 60
+                ? `${Math.floor(minutes / 60)}小时${minutes % 60}分`
+                : `${minutes}分`;
+            return `<span class="cooldown-hint">下次恢复: ${next.toLocaleString()}（约${label}）</span>`;
         }
 
         function showAddAccountModal() {
@@ -1093,7 +1260,7 @@
             if (userAgent) account.user_agent = userAgent;
             
             try {
-                const res = await fetch(`${API_BASE}/api/accounts/${id}`, {
+                const res = await apiFetch(`${API_BASE}/api/accounts/${id}`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(account)
@@ -1120,7 +1287,7 @@
             const userAgent = document.getElementById('newUserAgent').value;
 
             try {
-                const res = await fetch(`${API_BASE}/api/accounts`, {
+                const res = await apiFetch(`${API_BASE}/api/accounts`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ 
@@ -1130,7 +1297,8 @@
                         "csesidx": csesidx, 
                         "user_agent": userAgent })
                 });
-                if (!res.ok) throw new Error((await res.json()).detail);
+                const data = await res.json();
+                if (!res.ok || data.error) throw new Error(data.error || data.detail || '添加失败');
                 showToast('账号添加成功!', 'success');
                 closeModal('addAccountModal');
                 loadAccounts();
@@ -1138,11 +1306,46 @@
                 showToast('添加失败: ' + e.message, 'error');
             }
         }
+
+        function parseAccountJson(text) {
+            const textarea = document.getElementById('newAccountJson');
+            const raw = (typeof text === 'string' ? text : textarea.value || '').trim();
+            if (!raw) {
+                showToast('请先粘贴账号JSON', 'warning');
+                return;
+            }
+            let acc;
+            try {
+                const parsed = JSON.parse(raw);
+                acc = Array.isArray(parsed) ? parsed[0] : parsed;
+                if (!acc || typeof acc !== 'object') throw new Error('格式不正确');
+            } catch (err) {
+                showToast('解析失败: ' + err.message, 'error');
+                return;
+            }
+
+            document.getElementById('newTeamId').value = acc.team_id || '';
+            document.getElementById('newSecureCses').value = acc.secure_c_ses || '';
+            document.getElementById('newHostCoses').value = acc.host_c_oses || '';
+            document.getElementById('newCsesidx').value = acc.csesidx || '';
+            document.getElementById('newUserAgent').value = acc.user_agent || '';
+            showToast('已填充账号信息', 'success');
+        }
+
+        async function pasteAccountJson() {
+            try {
+                const text = await navigator.clipboard.readText();
+                document.getElementById('newAccountJson').value = text;
+                parseAccountJson(text);
+            } catch (e) {
+                showToast('无法读取剪贴板: ' + e.message, 'error');
+            }
+        }
         
         async function deleteAccount(id) {
             if (!confirm('确定要删除这个账号吗？')) return;
             try {
-                const res = await fetch(`${API_BASE}/api/accounts/${id}`, { method: 'DELETE' });
+                const res = await apiFetch(`${API_BASE}/api/accounts/${id}`, { method: 'DELETE' });
                 if (!res.ok) throw new Error((await res.json()).detail);
                 showToast('账号删除成功!', 'success');
                 loadAccounts();
@@ -1154,7 +1357,7 @@
         async function testAccount(id) {
             showToast(`正在测试账号ID: ${id}...`, 'info');
             try {
-                const res = await fetch(`${API_BASE}/api/accounts/${id}/test`);
+                const res = await apiFetch(`${API_BASE}/api/accounts/${id}/test`);
                 const data = await res.json();
                 if (res.ok && data.success) {
                     showToast(`账号 ${id} 测试成功!`, 'success');
@@ -1171,7 +1374,7 @@
             const acc = accountsData.find(a => a.id === id);
             const action = acc && acc.enabled !== false ? '停用' : '启用';
             try {
-                const res = await fetch(`${API_BASE}/api/accounts/${id}/toggle`, {
+                const res = await apiFetch(`${API_BASE}/api/accounts/${id}/toggle`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' }
                 });
@@ -1190,7 +1393,7 @@
         // --- 模型管理 (Models) ---
         async function loadModels() {
             try {
-                const res = await fetch(`${API_BASE}/api/models`);
+                const res = await apiFetch(`${API_BASE}/api/models`);
                 const data = await res.json();
                 modelsData = data.models || [];
                 renderModels();
@@ -1252,7 +1455,7 @@
             };
             
             try {
-                const res = await fetch(`${API_BASE}/api/models/${id}`, {
+                const res = await apiFetch(`${API_BASE}/api/models/${id}`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(model)
@@ -1276,7 +1479,7 @@
         // --- 系统设置 (Settings) ---
         async function loadConfig() {
             try {
-                const res = await fetch(`${API_BASE}/api/config`);
+                const res = await apiFetch(`${API_BASE}/api/config`);
                 configData = await res.json();
                 document.getElementById('proxyUrl').value = configData.proxy || '';
                 document.getElementById('configJson').value = JSON.stringify(configData, null, 2);
@@ -1285,10 +1488,177 @@
             }
         }
 
+        async function loadLogLevel() {
+            try {
+                const res = await apiFetch(`${API_BASE}/api/logging`);
+                const data = await res.json();
+                const select = document.getElementById('logLevelSelect');
+                if (select && data.level) {
+                    select.value = data.level;
+                }
+            } catch (e) {
+                console.warn('日志级别加载失败', e);
+            }
+        }
+
+        async function updateLogLevel(level) {
+            try {
+                const res = await apiFetch(`${API_BASE}/api/logging`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ level })
+                });
+                const data = await res.json();
+                if (!res.ok || data.error) {
+                    throw new Error(data.error || '设置失败');
+                }
+                showToast(`日志级别已切换为 ${data.level}`, 'success');
+            } catch (e) {
+                showToast('日志级别设置失败: ' + e.message, 'error');
+            }
+        }
+
+        // --- Token 管理 ---
+        async function loadTokens() {
+            try {
+                const res = await apiFetch(`${API_BASE}/api/tokens`);
+                const data = await res.json();
+                tokensData = data.tokens || [];
+                renderTokens();
+            } catch (e) {
+                showToast('加载 Token 失败: ' + e.message, 'error');
+            }
+        }
+
+        function renderTokens() {
+            const tbody = document.getElementById('tokensTableBody');
+            if (!tbody) return;
+            if (!tokensData.length) {
+                tbody.innerHTML = `<tr><td colspan="2" class="empty-state">暂无 Token</td></tr>`;
+                return;
+            }
+            tbody.innerHTML = tokensData.map(token => `
+                <tr>
+                    <td><code>${token}</code></td>
+                    <td style="white-space: nowrap;">
+                        <button class="btn btn-outline btn-sm" data-token="${token}" onclick="copyToken(this.dataset.token)">复制</button>
+                        <button class="btn btn-danger btn-sm" data-token="${token}" onclick="deleteToken(this.dataset.token)">删除</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        async function addToken() {
+            const manual = document.getElementById('manualToken').value.trim();
+            try {
+                const res = await apiFetch(`${API_BASE}/api/tokens`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(manual ? { token: manual } : {})
+                });
+                const data = await res.json();
+                if (!res.ok || data.error) throw new Error(data.error || '创建失败');
+                document.getElementById('manualToken').value = data.token;
+                showToast('Token 创建成功', 'success');
+                loadTokens();
+            } catch (e) {
+                showToast('创建 Token 失败: ' + e.message, 'error');
+            }
+        }
+
+        function generateToken() {
+            if (window.crypto && crypto.randomUUID) {
+                document.getElementById('manualToken').value = crypto.randomUUID().replace(/-/g, '');
+            } else {
+                document.getElementById('manualToken').value = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+            }
+        }
+
+        async function deleteToken(token) {
+            if (!confirm('确定删除该 Token 吗？')) return;
+            try {
+                const res = await apiFetch(`${API_BASE}/api/tokens/${token}`, { method: 'DELETE' });
+                const data = await res.json();
+                if (!res.ok || data.error) throw new Error(data.error || '删除失败');
+                showToast('Token 删除成功', 'success');
+                loadTokens();
+            } catch (e) {
+                showToast('删除 Token 失败: ' + e.message, 'error');
+            }
+        }
+
+        function copyToken(token) {
+            if (!token) {
+                showToast('无效的 Token', 'warning');
+                return;
+            }
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(token).then(() => {
+                    showToast('已复制', 'success');
+                }).catch(() => {
+                    fallbackCopy(token);
+                });
+            } else {
+                fallbackCopy(token);
+            }
+        }
+
+        function fallbackCopy(text) {
+            try {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+                showToast('已复制', 'success');
+            } catch (err) {
+                showToast('复制失败', 'error');
+            }
+        }
+
+        function logoutAdmin() {
+            localStorage.removeItem(ADMIN_TOKEN_KEY);
+            document.cookie = 'admin_token=; Max-Age=0; path=/';
+            showToast('已注销', 'success');
+            updateLoginButton();
+        }
+
+        function showLoginModal() {
+            document.getElementById('loginPassword').value = '';
+            openModal('loginModal');
+        }
+
+        async function submitLogin() {
+            const pwd = document.getElementById('loginPassword').value;
+            if (!pwd) {
+                showToast('请输入密码', 'warning');
+                return;
+            }
+            try {
+                const res = await fetch(`${API_BASE}/api/auth/login`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: pwd })
+                });
+                const data = await res.json();
+                if (!res.ok || data.error) {
+                    throw new Error(data.error || '登录失败');
+                }
+                localStorage.setItem(ADMIN_TOKEN_KEY, data.token);
+                showToast('登录成功', 'success');
+                closeModal('loginModal');
+                loadAllData();
+                updateLoginButton();
+            } catch (e) {
+                showToast('登录失败: ' + e.message, 'error');
+            }
+        }
+
         async function saveSettings() {
             const proxyUrl = document.getElementById('proxyUrl').value;
             try {
-                const res = await fetch(`${API_BASE}/api/config`, {
+                const res = await apiFetch(`${API_BASE}/api/config`, {
                     method: 'PUT',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ proxy: proxyUrl })
@@ -1307,7 +1677,7 @@
             proxyStatus.textContent = '测试中...';
             proxyStatus.style.color = 'var(--text-muted)';
             try {
-                const res = await fetch(`${API_BASE}/api/proxy/test`, {
+                const res = await apiFetch(`${API_BASE}/api/proxy/test`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ proxy: proxyUrl })
@@ -1352,7 +1722,7 @@
             reader.onload = async (e) => {
                 try {
                     const newConfig = JSON.parse(e.target.result);
-                    const res = await fetch(`${API_BASE}/api/config/upload`, {
+                    const res = await apiFetch(`${API_BASE}/api/config/upload`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(newConfig)

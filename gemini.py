@@ -17,11 +17,15 @@ import shutil
 import mimetypes
 import requests
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
+import builtins
+import secrets
 from flask import Flask, request, Response, jsonify, send_from_directory, abort
 from flask_cors import CORS
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
 
 # 禁用SSL警告
 import urllib3
@@ -43,9 +47,227 @@ LIST_FILE_METADATA_URL = f"{BASE_URL}/widgetListSessionFileMetadata"
 ADD_CONTEXT_FILE_URL = f"{BASE_URL}/widgetAddContextFile"
 GETOXSRF_URL = "https://business.gemini.google/auth/getoxsrf"
 
+# 账号错误冷却时间（秒）
+AUTH_ERROR_COOLDOWN_SECONDS = 900      # 凭证错误，15分钟
+RATE_LIMIT_COOLDOWN_SECONDS = 300      # 触发限额，5分钟
+GENERIC_ERROR_COOLDOWN_SECONDS = 120   # 其他错误的短暂冷却
+LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
+DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+CURRENT_LOG_LEVEL_NAME = DEFAULT_LOG_LEVEL if DEFAULT_LOG_LEVEL in LOG_LEVELS else "INFO"
+CURRENT_LOG_LEVEL = LOG_LEVELS[CURRENT_LOG_LEVEL_NAME]
+ADMIN_SECRET_KEY = None
+API_TOKENS = set()
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    ZoneInfo = None
+
 # Flask应用
 app = Flask(__name__, static_folder='.')
 CORS(app)
+
+
+def _infer_log_level(text: str) -> str:
+    t = text.strip()
+    if t.startswith("[DEBUG]"):
+        return "DEBUG"
+    if t.startswith("[ERROR]") or t.startswith("[!]"):
+        return "ERROR"
+    return "INFO"
+
+
+_original_print = builtins.print
+
+
+def filtered_print(*args, **kwargs):
+    """简单的日志过滤，根据全局日志级别屏蔽低级别输出"""
+    level = kwargs.pop("_level", None)
+    sep = kwargs.get("sep", " ")
+    text = sep.join(str(a) for a in args)
+    level_name = (level or _infer_log_level(text)).upper()
+    if LOG_LEVELS.get(level_name, LOG_LEVELS["INFO"]) >= CURRENT_LOG_LEVEL:
+        _original_print(*args, **kwargs)
+
+
+builtins.print = filtered_print
+
+
+def set_log_level(level: str, persist: bool = False):
+    """设置全局日志级别"""
+    global CURRENT_LOG_LEVEL_NAME, CURRENT_LOG_LEVEL
+    lvl = (level or "").upper()
+    if lvl not in LOG_LEVELS:
+        raise ValueError(f"无效日志级别: {level}")
+    CURRENT_LOG_LEVEL_NAME = lvl
+    CURRENT_LOG_LEVEL = LOG_LEVELS[lvl]
+    if persist and globals().get("account_manager") and account_manager.config is not None:
+        account_manager.config["log_level"] = lvl
+        account_manager.save_config()
+    _original_print(f"[LOG] 当前日志级别: {CURRENT_LOG_LEVEL_NAME}")
+
+
+class AccountError(Exception):
+    """基础账号异常"""
+
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class AccountAuthError(AccountError):
+    """凭证/权限相关异常"""
+
+
+class AccountRateLimitError(AccountError):
+    """配额或限流异常"""
+
+
+class AccountRequestError(AccountError):
+    """其他请求异常"""
+
+
+class NoAvailableAccount(AccountError):
+    """无可用账号异常"""
+
+
+def get_admin_secret_key() -> str:
+    """获取/初始化后台密钥"""
+    global ADMIN_SECRET_KEY
+    if ADMIN_SECRET_KEY:
+        return ADMIN_SECRET_KEY
+    if account_manager.config is None:
+        ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "change_me_secret")
+        return ADMIN_SECRET_KEY
+    secret = account_manager.config.get("admin_secret_key") or os.getenv("ADMIN_SECRET_KEY")
+    if not secret:
+        secret = secrets.token_urlsafe(32)
+        account_manager.config["admin_secret_key"] = secret
+        account_manager.save_config()
+    ADMIN_SECRET_KEY = secret
+    return ADMIN_SECRET_KEY
+
+
+def load_api_tokens():
+    """从配置加载用户访问token"""
+    global API_TOKENS
+    API_TOKENS = set()
+    if not account_manager.config:
+        return
+    tokens = account_manager.config.get("api_tokens") or account_manager.config.get("api_token")
+    if isinstance(tokens, str):
+        API_TOKENS.add(tokens)
+    elif isinstance(tokens, list):
+        for t in tokens:
+            if isinstance(t, str):
+                API_TOKENS.add(t)
+
+
+def persist_api_tokens():
+    if account_manager.config is None:
+        account_manager.config = {}
+    account_manager.config["api_tokens"] = list(API_TOKENS)
+    account_manager.save_config()
+
+
+def get_admin_password_hash() -> Optional[str]:
+    if account_manager.config:
+        return account_manager.config.get("admin_password_hash")
+    return None
+
+
+def set_admin_password(password: str):
+    if not password:
+        raise ValueError("密码不能为空")
+    if account_manager.config is None:
+        account_manager.config = {}
+    account_manager.config["admin_password_hash"] = generate_password_hash(password)
+    account_manager.save_config()
+
+
+def is_valid_api_token(token: str) -> bool:
+    if not token:
+        return False
+    if verify_admin_token(token):
+        return True
+    return token in API_TOKENS
+
+
+def require_api_auth(func):
+    """开放接口需要 api_token 或 admin token"""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        token = (
+            request.headers.get("X-API-Token")
+            or request.headers.get("Authorization", "").replace("Bearer ", "")
+            or request.cookies.get("admin_token")
+        )
+        if not is_valid_api_token(token):
+            return jsonify({"error": "未授权"}), 401
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def create_admin_token(exp_seconds: int = 86400) -> str:
+    payload = {
+        "exp": time.time() + exp_seconds,
+        "ts": int(time.time())
+    }
+    payload_b = json.dumps(payload, separators=(",", ":")).encode()
+    b64 = base64.urlsafe_b64encode(payload_b).decode().rstrip("=")
+    secret = get_admin_secret_key().encode()
+    signature = hmac.new(secret, b64.encode(), hashlib.sha256).hexdigest()
+    return f"{b64}.{signature}"
+
+
+def verify_admin_token(token: str) -> bool:
+    if not token:
+        return False
+    try:
+        b64, sig = token.split(".", 1)
+    except ValueError:
+        return False
+    expected_sig = hmac.new(get_admin_secret_key().encode(), b64.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected_sig, sig):
+        return False
+    padding = '=' * (-len(b64) % 4)
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(b64 + padding).decode())
+    except Exception:
+        return False
+    if payload.get("exp", 0) < time.time():
+        return False
+    return True
+
+
+def require_admin(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        token = (
+            request.headers.get("X-Admin-Token")
+            or request.headers.get("Authorization", "").replace("Bearer ", "")
+            or request.cookies.get("admin_token")
+        )
+        if not verify_admin_token(token):
+            return jsonify({"error": "未授权"}), 401
+        return func(*args, **kwargs)
+    return wrapper
+
+
+def seconds_until_next_pt_midnight(now_ts: Optional[float] = None) -> int:
+    """计算距离下一个 PT 午夜的秒数，用于配额冷却"""
+    now_utc = datetime.now(timezone.utc) if now_ts is None else datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    if ZoneInfo:
+        pt_tz = ZoneInfo("America/Los_Angeles")
+        now_pt = now_utc.astimezone(pt_tz)
+    else:
+        # 兼容旧版本 Python 的简易回退（不考虑夏令时）
+        now_pt = now_utc - timedelta(hours=8)
+
+    tomorrow = (now_pt + timedelta(days=1)).date()
+    midnight_pt = datetime.combine(tomorrow, datetime.min.time(), tzinfo=now_pt.tzinfo)
+    delta = (midnight_pt - now_pt).total_seconds()
+    return max(0, int(delta))
 
 
 class AccountManager:
@@ -55,14 +277,26 @@ class AccountManager:
         self.config = None
         self.accounts = []  # 账号列表
         self.current_index = 0  # 当前轮训索引
-        self.account_states = {}  # 账号状态: {index: {jwt, jwt_time, session, available}}
+        self.account_states = {}  # 账号状态: {index: {jwt, jwt_time, session, available, cooldown_until, cooldown_reason}}
         self.lock = threading.Lock()
+        self.auth_error_cooldown = AUTH_ERROR_COOLDOWN_SECONDS
+        self.rate_limit_cooldown = RATE_LIMIT_COOLDOWN_SECONDS
+        self.generic_error_cooldown = GENERIC_ERROR_COOLDOWN_SECONDS
     
     def load_config(self):
         """加载配置"""
         if CONFIG_FILE.exists():
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 self.config = json.load(f)
+                if "log_level" in self.config:
+                    try:
+                        set_log_level(self.config.get("log_level"), persist=False)
+                    except Exception:
+                        pass
+                if "admin_secret_key" in self.config:
+                    global ADMIN_SECRET_KEY
+                    ADMIN_SECRET_KEY = self.config.get("admin_secret_key")
+                load_api_tokens()
                 self.accounts = self.config.get("accounts", [])
                 # 初始化账号状态
                 for i, acc in enumerate(self.accounts):
@@ -71,7 +305,9 @@ class AccountManager:
                         "jwt": None,
                         "jwt_time": 0,
                         "session": None,
-                        "available": available
+                        "available": available,
+                        "cooldown_until": acc.get("cooldown_until"),
+                        "cooldown_reason": acc.get("unavailable_reason") or acc.get("cooldown_reason") or ""
                     }
         return self.config
     
@@ -91,18 +327,89 @@ class AccountManager:
                 self.account_states[index]["available"] = False
                 self.save_config()
                 print(f"[!] 账号 {index} 已标记为不可用: {reason}")
+
+    def mark_account_cooldown(self, index: int, reason: str = "", cooldown_seconds: Optional[int] = None):
+        """临时拉黑账号（冷却），在冷却时间内不会被选择"""
+        if cooldown_seconds is None:
+            cooldown_seconds = self.generic_error_cooldown
+
+        with self.lock:
+            if 0 <= index < len(self.accounts):
+                now_ts = time.time()
+                new_until = now_ts + cooldown_seconds
+                state = self.account_states.setdefault(index, {})
+                current_until = state.get("cooldown_until") or 0
+                # 如果已有更长的冷却，则不重复更新
+                if current_until > now_ts and current_until >= new_until:
+                    return
+
+                until = max(new_until, current_until)
+                state["cooldown_until"] = until
+                state["cooldown_reason"] = reason
+                state["jwt"] = None
+                state["jwt_time"] = 0
+                state["session"] = None
+
+                # 在配置中记录冷却信息，便于前端展示
+                self.accounts[index]["cooldown_until"] = until
+                self.accounts[index]["unavailable_reason"] = reason
+                self.accounts[index]["unavailable_time"] = datetime.now().isoformat()
+
+                self.save_config()
+                print(f"[!] 账号 {index} 进入冷却 {cooldown_seconds} 秒: {reason}")
+
+    def _is_in_cooldown(self, index: int, now_ts: Optional[float] = None) -> bool:
+        """检查账号是否处于冷却期"""
+        now_ts = now_ts or time.time()
+        state = self.account_states.get(index, {})
+        cooldown_until = state.get("cooldown_until")
+        if not cooldown_until:
+            return False
+        return now_ts < cooldown_until
+
+    def get_next_cooldown_info(self) -> Optional[dict]:
+        """获取最近即将结束冷却的账号信息"""
+        now_ts = time.time()
+        candidates = []
+        for idx, state in self.account_states.items():
+            cooldown_until = state.get("cooldown_until")
+            if cooldown_until and cooldown_until > now_ts and state.get("available", True):
+                candidates.append((cooldown_until, idx))
+        if not candidates:
+            return None
+        cooldown_until, idx = min(candidates, key=lambda x: x[0])
+        return {"index": idx, "cooldown_until": cooldown_until}
+
+    def is_account_available(self, index: int) -> bool:
+        """计算账号当前是否可用（考虑冷却和手动禁用）"""
+        state = self.account_states.get(index, {})
+        if not state.get("available", True):
+            return False
+        return not self._is_in_cooldown(index)
     
     def get_available_accounts(self):
         """获取可用账号列表"""
-        return [(i, acc) for i, acc in enumerate(self.accounts) 
-                if self.account_states.get(i, {}).get("available", True)]
+        now_ts = time.time()
+        available_accounts = []
+        for i, acc in enumerate(self.accounts):
+            state = self.account_states.get(i, {})
+            if not state.get("available", True):
+                continue
+            if self._is_in_cooldown(i, now_ts):
+                continue
+            available_accounts.append((i, acc))
+        return available_accounts
     
     def get_next_account(self):
         """轮训获取下一个可用账号"""
         with self.lock:
             available = self.get_available_accounts()
             if not available:
-                raise Exception("没有可用的账号")
+                cooldown_info = self.get_next_cooldown_info()
+                if cooldown_info:
+                    remaining = int(max(0, cooldown_info["cooldown_until"] - time.time()))
+                    raise NoAvailableAccount(f"没有可用的账号（最近冷却账号 {cooldown_info['index']}，约 {remaining} 秒后可重试）")
+                raise NoAvailableAccount("没有可用的账号")
             
             # 轮训选择
             self.current_index = self.current_index % len(available)
@@ -260,17 +567,30 @@ def get_jwt_for_account(account: dict, proxy: str) -> str:
         "cookie": f'__Secure-C_SES={secure_c_ses}; __Host-C_OSES={host_c_oses}',
     }
 
-    resp = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=30)
+    try:
+        resp = requests.get(url, headers=headers, proxies=proxies, verify=False, timeout=30)
+    except requests.RequestException as e:
+        raise AccountRequestError(f"获取JWT 请求失败: {e}") from e
+
+    if resp.status_code != 200:
+        raise_for_account_response(resp, "获取JWT")
 
     # 处理Google安全前缀
     text = resp.text
     if text.startswith(")]}'\n") or text.startswith(")]}'"): 
         text = text[4:].strip()
 
-    data = json.loads(text)
-    key_id = data["keyId"]
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise AccountAuthError(f"解析JWT响应失败: {e}") from e
+
+    key_id = data.get("keyId")
+    xsrf_token = data.get("xsrfToken")
+    if not key_id or not xsrf_token:
+        raise AccountAuthError(f"JWT 响应缺少 keyId/xsrfToken: {data}")
+
     print(f"账号: {account.get('csesidx')} 账号可用! key_id: {key_id}")
-    xsrf_token = data["xsrfToken"]
 
     key_bytes = decode_xsrf_token(xsrf_token)
 
@@ -292,6 +612,20 @@ def get_headers(jwt: str) -> dict:
     }
 
 
+def raise_for_account_response(resp: requests.Response, action: str):
+    """根据响应状态抛出对应的账号异常"""
+    status = resp.status_code
+    body_preview = resp.text[:500] if resp.text else ""
+    lower_body = body_preview.lower()
+
+    if status in (401, 403):
+        raise AccountAuthError(f"{action} 认证失败: {status} - {body_preview}", status)
+    if status == 429 or "quota" in lower_body or "exceed" in lower_body or "limit" in lower_body:
+        raise AccountRateLimitError(f"{action} 触发限额: {status} - {body_preview}", status)
+
+    raise AccountRequestError(f"{action} 请求失败: {status} - {body_preview}", status)
+
+
 def ensure_jwt_for_account(account_idx: int, account: dict):
     """确保指定账号的JWT有效，必要时刷新"""
     print(f"[DEBUG][ensure_jwt_for_account] 开始 - 账号索引: {account_idx}, CSESIDX: {account.get('csesidx')}")
@@ -310,8 +644,6 @@ def ensure_jwt_for_account(account_idx: int, account: dict):
                 print(f"[DEBUG][ensure_jwt_for_account] JWT刷新成功 - 耗时: {time.time() - refresh_start:.2f}秒")
             except Exception as e:
                 print(f"[DEBUG][ensure_jwt_for_account] JWT刷新失败: {e}")
-                # JWT获取失败，标记账号不可用
-                account_manager.mark_account_unavailable(account_idx, str(e))
                 raise
         else:
             print(f"[DEBUG][ensure_jwt_for_account] 使用缓存JWT")
@@ -338,21 +670,24 @@ def create_chat_session(jwt: str, team_id: str, proxy: str) -> str:
     print(f"[DEBUG][create_chat_session] 使用代理: {proxy}")
     
     request_start = time.time()
-    resp = requests.post(
-        CREATE_SESSION_URL,
-        headers=get_headers(jwt),
-        json=body,
-        proxies=proxies,
-        verify=False,
-        timeout=30
-    )
+    try:
+        resp = requests.post(
+            CREATE_SESSION_URL,
+            headers=get_headers(jwt),
+            json=body,
+            proxies=proxies,
+            verify=False,
+            timeout=30
+        )
+    except requests.RequestException as e:
+        raise AccountRequestError(f"创建会话请求失败: {e}") from e
     print(f"[DEBUG][create_chat_session] 请求完成 - 状态码: {resp.status_code}, 耗时: {time.time() - request_start:.2f}秒")
 
     if resp.status_code != 200:
         print(f"[DEBUG][create_chat_session] 请求失败 - 响应: {resp.text[:500]}")
         if resp.status_code == 401:
             print(f"[DEBUG][create_chat_session] 401错误 - 可能是team_id填错了")
-        raise Exception(f"创建会话失败: {resp.status_code}")
+        raise_for_account_response(resp, "创建会话")
 
     data = resp.json()
     session_name = data.get("session", {}).get("name")
@@ -429,19 +764,22 @@ def upload_file_to_gemini(jwt: str, session_name: str, team_id: str,
     print(f"[DEBUG][upload_file_to_gemini] 使用代理: {proxy if proxy else '无'}")
     
     request_start = time.time()
-    resp = requests.post(
-        ADD_CONTEXT_FILE_URL,
-        headers=get_headers(jwt),
-        json=body,
-        proxies=proxies,
-        verify=False,
-        timeout=60
-    )
+    try:
+        resp = requests.post(
+            ADD_CONTEXT_FILE_URL,
+            headers=get_headers(jwt),
+            json=body,
+            proxies=proxies,
+            verify=False,
+            timeout=60
+        )
+    except requests.RequestException as e:
+        raise AccountRequestError(f"文件上传请求失败: {e}") from e
     print(f"[DEBUG][upload_file_to_gemini] 请求完成 - 耗时: {time.time() - request_start:.2f}秒, 状态码: {resp.status_code}")
     
     if resp.status_code != 200:
         print(f"[DEBUG][upload_file_to_gemini] 上传失败 - 响应内容: {resp.text[:500]}")
-        raise Exception(f"文件上传失败: {resp.status_code} - {resp.text}")
+        raise_for_account_response(resp, "文件上传")
     
     parse_start = time.time()
     data = resp.json()
@@ -723,6 +1061,9 @@ def upload_inline_image_to_gemini(jwt: str, session_name: str, team_id: str,
             return None
         
         return upload_file_to_gemini(jwt, session_name, team_id, file_content, filename, mime_type, proxy)
+    except AccountError:
+        # 让账号相关错误向上抛出，以便触发冷却
+        raise
     except Exception:
         return None
 
@@ -755,18 +1096,21 @@ def stream_chat_with_images(jwt: str, sess_name: str, message: str,
     }
 
     proxies = {"http": proxy, "https": proxy} if proxy else None
-    resp = requests.post(
-        STREAM_ASSIST_URL,
-        headers=get_headers(jwt),
-        json=body,
-        proxies=proxies,
-        verify=False,
-        timeout=120,
-        stream=True
-    )
+    try:
+        resp = requests.post(
+            STREAM_ASSIST_URL,
+            headers=get_headers(jwt),
+            json=body,
+            proxies=proxies,
+            verify=False,
+            timeout=120,
+            stream=True
+        )
+    except requests.RequestException as e:
+        raise AccountRequestError(f"聊天请求失败: {e}") from e
 
     if resp.status_code != 200:
-        raise Exception(f"请求失败: {resp.status_code}")
+        raise_for_account_response(resp, "聊天请求")
 
     # 收集完整响应
     full_response = ""
@@ -948,6 +1292,7 @@ def parse_attachment(att: Dict, result: ChatResponse, proxy: Optional[str] = Non
 # ==================== OpenAPI 接口 ====================
 
 @app.route('/v1/models', methods=['GET'])
+@require_api_auth
 def list_models():
     """获取模型列表"""
     models_config = account_manager.config.get("models", [])
@@ -980,6 +1325,7 @@ def list_models():
 
 
 @app.route('/v1/files', methods=['POST'])
+@require_api_auth
 def upload_file():
     """OpenAI 兼容的文件上传接口"""
     import traceback
@@ -1010,7 +1356,15 @@ def upload_file():
         print(f"[文件上传] 步骤2完成: 文件大小={len(file_content)}字节, MIME类型={mime_type}, 耗时={time.time()-step_start:.3f}秒")
         
         # 获取账号信息
-        max_retries = len(account_manager.accounts)
+        available_accounts = account_manager.get_available_accounts()
+        if not available_accounts:
+            next_cd = account_manager.get_next_cooldown_info()
+            wait_msg = ""
+            if next_cd:
+                wait_msg = f"（最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
+            return jsonify({"error": {"message": f"没有可用的账号{wait_msg}", "type": "rate_limit"}}), 429
+
+        max_retries = len(available_accounts)
         last_error = None
         gemini_file_id = None
         print(f"[文件上传] 步骤3: 开始尝试上传, 最大重试次数={max_retries}")
@@ -1018,6 +1372,7 @@ def upload_file():
         for retry_idx in range(max_retries):
             retry_start = time.time()
             print(f"\n[文件上传] --- 第{retry_idx+1}次尝试 ---")
+            account_idx = None
             try:
                 # 获取账号
                 step_start = time.time()
@@ -1073,20 +1428,52 @@ def upload_file():
                     })
                 else:
                     print(f"[文件上传] 警告: gemini_file_id为空")
-                    
+            
+            except AccountRateLimitError as e:
+                last_error = e
+                if account_idx is not None:
+                    pt_wait = seconds_until_next_pt_midnight()
+                    cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+                    account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
+                print(f"[文件上传] 第{retry_idx+1}次尝试失败(限额): {e}")
+                print(f"[文件上传] 本次尝试耗时: {time.time()-retry_start:.3f}秒")
+                continue
+            except AccountAuthError as e:
+                last_error = e
+                if account_idx is not None:
+                    account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
+                print(f"[文件上传] 第{retry_idx+1}次尝试失败(凭证): {e}")
+                print(f"[文件上传] 本次尝试耗时: {time.time()-retry_start:.3f}秒")
+                continue
+            except AccountRequestError as e:
+                last_error = e
+                if account_idx is not None:
+                    account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+                print(f"[文件上传] 第{retry_idx+1}次尝试失败(请求异常): {e}")
+                print(f"[文件上传] 本次尝试耗时: {time.time()-retry_start:.3f}秒")
+                continue
+            except NoAvailableAccount as e:
+                last_error = e
+                print(f"[文件上传] 无可用账号: {e}")
+                break
             except Exception as e:
                 last_error = e
                 print(f"[文件上传] 第{retry_idx+1}次尝试失败: {type(e).__name__}: {e}")
                 print(f"[文件上传] 堆栈跟踪:\n{traceback.format_exc()}")
                 print(f"[文件上传] 本次尝试耗时: {time.time()-retry_start:.3f}秒")
+                if account_idx is None:
+                    break
                 continue
         
         total_time = time.time() - request_start_time
         print(f"\n[文件上传] ===== 所有重试均失败 =====")
-        print(f"[文件上传] 最后错误: {last_error}")
+        error_message = last_error or "没有可用的账号"
+        print(f"[文件上传] 最后错误: {error_message}")
         print(f"[文件上传] 总耗时: {total_time:.3f}秒")
         print(f"{'='*60}\n")
-        return jsonify({"error": {"message": f"文件上传失败: {last_error}", "type": "api_error"}}), 500
+        status_code = 429 if isinstance(last_error, (AccountRateLimitError, NoAvailableAccount)) else 500
+        err_type = "rate_limit" if status_code == 429 else "api_error"
+        return jsonify({"error": {"message": f"文件上传失败: {error_message}", "type": err_type}}), status_code
         
     except Exception as e:
         total_time = time.time() - request_start_time
@@ -1100,6 +1487,7 @@ def upload_file():
 
 
 @app.route('/v1/files', methods=['GET'])
+@require_api_auth
 def list_files():
     """获取已上传文件列表"""
     files = file_manager.list_files()
@@ -1117,6 +1505,7 @@ def list_files():
 
 
 @app.route('/v1/files/<file_id>', methods=['GET'])
+@require_api_auth
 def get_file(file_id):
     """获取文件信息"""
     file_info = file_manager.get_file(file_id)
@@ -1134,6 +1523,7 @@ def get_file(file_id):
 
 
 @app.route('/v1/files/<file_id>', methods=['DELETE'])
+@require_api_auth
 def delete_file(file_id):
     """删除文件"""
     if file_manager.delete_file(file_id):
@@ -1146,6 +1536,7 @@ def delete_file(file_id):
 
 
 @app.route('/v1/chat/completions', methods=['POST'])
+@require_api_auth
 def chat_completions():
     """聊天对话接口（支持图片输入输出）"""
     try:
@@ -1214,11 +1605,20 @@ def chat_completions():
             return jsonify({"error": "No user message found"}), 400
         
         # 轮训获取账号
-        max_retries = len(account_manager.accounts)
+        available_accounts = account_manager.get_available_accounts()
+        if not available_accounts:
+            next_cd = account_manager.get_next_cooldown_info()
+            wait_msg = ""
+            if next_cd:
+                wait_msg = f"（最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
+            return jsonify({"error": f"没有可用的账号{wait_msg}"}), 429
+
+        max_retries = len(available_accounts)
         last_error = None
         chat_response = None
         
-        for _ in range(max_retries):
+        for retry_idx in range(max_retries):
+            account_idx = None
             try:
                 account_idx, account = account_manager.get_next_account()
                 session, jwt, team_id = ensure_session_for_account(account_idx, account)
@@ -1232,12 +1632,37 @@ def chat_completions():
                 
                 chat_response = stream_chat_with_images(jwt, session, user_message, proxy, team_id, gemini_file_ids)
                 break
+            except AccountRateLimitError as e:
+                last_error = e
+                if account_idx is not None:
+                    pt_wait = seconds_until_next_pt_midnight()
+                    cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+                    account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
+                print(f"[聊天] 第{retry_idx+1}次尝试失败(限额): {e}")
+                continue
+            except AccountAuthError as e:
+                last_error = e
+                if account_idx is not None:
+                    account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
+                print(f"[聊天] 第{retry_idx+1}次尝试失败(凭证): {e}")
+                continue
+            except AccountRequestError as e:
+                last_error = e
+                if account_idx is not None:
+                    account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+                print(f"[聊天] 第{retry_idx+1}次尝试失败(请求异常): {e}")
+                continue
             except Exception as e:
                 last_error = e
+                print(f"[聊天] 第{retry_idx+1}次尝试失败: {type(e).__name__}: {e}")
+                if account_idx is None:
+                    break
                 continue
-        else:
-            # 所有账号都失败
-            return jsonify({"error": f"所有账号请求失败: {last_error}"}), 500
+        
+        if chat_response is None:
+            error_message = last_error or "没有可用的账号"
+            status_code = 429 if isinstance(last_error, (AccountRateLimitError, NoAvailableAccount)) else 500
+            return jsonify({"error": f"所有账号请求失败: {error_message}"}), status_code
 
         # 构建响应内容（包含图片）
         response_content = build_openai_response_content(chat_response, request.host_url)
@@ -1378,6 +1803,7 @@ def health_check():
 
 
 @app.route('/api/status', methods=['GET'])
+@require_admin
 def system_status():
     """获取系统状态"""
     total, available = account_manager.get_account_count()
@@ -1406,16 +1832,23 @@ def index():
     return send_from_directory('.', 'index.html')
 
 @app.route('/chat_history.html')
+@require_admin
 def chat_history():
     """返回聊天记录页面"""
     return send_from_directory('.', 'chat_history.html')
 
 @app.route('/api/accounts', methods=['GET'])
+@require_admin
 def get_accounts():
     """获取账号列表"""
     accounts_data = []
+    now_ts = time.time()
     for i, acc in enumerate(account_manager.accounts):
         state = account_manager.account_states.get(i, {})
+        cooldown_until = state.get("cooldown_until")
+        cooldown_active = bool(cooldown_until and cooldown_until > now_ts)
+        effective_available = state.get("available", True) and not cooldown_active
+
         # 返回完整值用于编辑，前端显示时再截断
         accounts_data.append({
             "id": i,
@@ -1424,17 +1857,29 @@ def get_accounts():
             "host_c_oses": acc.get("host_c_oses", ""),
             "csesidx": acc.get("csesidx", ""),
             "user_agent": acc.get("user_agent", ""),
-            "available": state.get("available", True),
+            "available": effective_available,
             "unavailable_reason": acc.get("unavailable_reason", ""),
+            "cooldown_until": cooldown_until if cooldown_active else None,
+            "cooldown_reason": state.get("cooldown_reason", ""),
             "has_jwt": state.get("jwt") is not None
         })
     return jsonify({"accounts": accounts_data})
 
 
 @app.route('/api/accounts', methods=['POST'])
+@require_admin
 def add_account():
     """添加账号"""
     data = request.json
+    # 去重：基于 csesidx 或 team_id 检查
+    new_csesidx = data.get("csesidx", "")
+    new_team_id = data.get("team_id", "")
+    for acc in account_manager.accounts:
+        if new_csesidx and acc.get("csesidx") == new_csesidx:
+            return jsonify({"error": "账号已存在（同 csesidx）"}), 400
+        if new_team_id and acc.get("team_id") == new_team_id and new_csesidx == acc.get("csesidx"):
+            return jsonify({"error": "账号已存在（同 team_id + csesidx）"}), 400
+
     new_account = {
         "team_id": data.get("team_id", ""),
         "secure_c_ses": data.get("secure_c_ses", ""),
@@ -1450,7 +1895,9 @@ def add_account():
         "jwt": None,
         "jwt_time": 0,
         "session": None,
-        "available": True
+        "available": True,
+        "cooldown_until": None,
+        "cooldown_reason": ""
     }
     account_manager.config["accounts"] = account_manager.accounts
     account_manager.save_config()
@@ -1459,6 +1906,7 @@ def add_account():
 
 
 @app.route('/api/accounts/<int:account_id>', methods=['PUT'])
+@require_admin
 def update_account(account_id):
     """更新账号"""
     if account_id < 0 or account_id >= len(account_manager.accounts):
@@ -1485,6 +1933,7 @@ def update_account(account_id):
 
 
 @app.route('/api/accounts/<int:account_id>', methods=['DELETE'])
+@require_admin
 def delete_account(account_id):
     """删除账号"""
     if account_id < 0 or account_id >= len(account_manager.accounts):
@@ -1506,6 +1955,7 @@ def delete_account(account_id):
 
 
 @app.route('/api/accounts/<int:account_id>/toggle', methods=['POST'])
+@require_admin
 def toggle_account(account_id):
     """切换账号状态"""
     if account_id < 0 or account_id >= len(account_manager.accounts):
@@ -1520,12 +1970,16 @@ def toggle_account(account_id):
         # 重新启用时清除错误信息
         account_manager.accounts[account_id].pop("unavailable_reason", None)
         account_manager.accounts[account_id].pop("unavailable_time", None)
+        state.pop("cooldown_until", None)
+        state.pop("cooldown_reason", None)
+        account_manager.accounts[account_id].pop("cooldown_until", None)
     
     account_manager.save_config()
     return jsonify({"success": True, "available": not current})
 
 
 @app.route('/api/accounts/<int:account_id>/test', methods=['GET'])
+@require_admin
 def test_account(account_id):
     """测试账号JWT获取"""
     if account_id < 0 or account_id >= len(account_manager.accounts):
@@ -1537,11 +1991,23 @@ def test_account(account_id):
     try:
         jwt = get_jwt_for_account(account, proxy)
         return jsonify({"success": True, "message": "JWT获取成功"})
+    except AccountRateLimitError as e:
+        pt_wait = seconds_until_next_pt_midnight()
+        cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+        account_manager.mark_account_cooldown(account_id, str(e), cooldown_seconds)
+        return jsonify({"success": False, "message": str(e), "cooldown": cooldown_seconds})
+    except AccountAuthError as e:
+        account_manager.mark_account_cooldown(account_id, str(e), account_manager.auth_error_cooldown)
+        return jsonify({"success": False, "message": str(e), "cooldown": account_manager.auth_error_cooldown})
+    except AccountRequestError as e:
+        account_manager.mark_account_cooldown(account_id, str(e), account_manager.generic_error_cooldown)
+        return jsonify({"success": False, "message": str(e), "cooldown": account_manager.generic_error_cooldown})
     except Exception as e:
         return jsonify({"success": False, "message": str(e)})
 
 
 @app.route('/api/models', methods=['GET'])
+@require_admin
 def get_models_config():
     """获取模型配置"""
     models = account_manager.config.get("models", [])
@@ -1549,6 +2015,7 @@ def get_models_config():
 
 
 @app.route('/api/models', methods=['POST'])
+@require_admin
 def add_model():
     """添加模型"""
     data = request.json
@@ -1571,6 +2038,7 @@ def add_model():
 
 
 @app.route('/api/models/<model_id>', methods=['PUT'])
+@require_admin
 def update_model(model_id):
     """更新模型"""
     models = account_manager.config.get("models", [])
@@ -1594,6 +2062,7 @@ def update_model(model_id):
 
 
 @app.route('/api/models/<model_id>', methods=['DELETE'])
+@require_admin
 def delete_model(model_id):
     """删除模型"""
     models = account_manager.config.get("models", [])
@@ -1607,27 +2076,127 @@ def delete_model(model_id):
 
 
 @app.route('/api/config', methods=['GET'])
+@require_admin
 def get_config():
     """获取完整配置"""
     return jsonify(account_manager.config)
 
 
 @app.route('/api/config', methods=['PUT'])
+@require_admin
 def update_config():
     """更新配置"""
     data = request.json
     if "proxy" in data:
         account_manager.config["proxy"] = data["proxy"]
+    if "log_level" in data:
+        try:
+            set_log_level(data["log_level"], persist=True)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
     account_manager.save_config()
     return jsonify({"success": True})
 
 
+@app.route('/api/logging', methods=['GET', 'POST'])
+@require_admin
+def logging_config():
+    """获取或设置日志级别"""
+    if request.method == 'GET':
+        return jsonify({
+            "level": CURRENT_LOG_LEVEL_NAME,
+            "levels": list(LOG_LEVELS.keys())
+        })
+    
+    data = request.json or {}
+    level = data.get("level", "").upper()
+    if level not in LOG_LEVELS:
+        return jsonify({"error": "无效日志级别"}), 400
+    
+    set_log_level(level, persist=True)
+    return jsonify({"success": True, "level": CURRENT_LOG_LEVEL_NAME})
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def admin_login():
+    """后台登录，返回 token。若尚未设置密码，则首次设置。"""
+    data = request.json or {}
+    password = data.get("password", "")
+    if not password:
+        return jsonify({"error": "密码不能为空"}), 400
+    
+    stored_hash = get_admin_password_hash()
+    if stored_hash:
+        if not check_password_hash(stored_hash, password):
+            return jsonify({"error": "密码错误"}), 401
+    else:
+        # 首次设置密码
+        set_admin_password(password)
+    
+    token = create_admin_token()
+    resp = jsonify({"token": token, "level": CURRENT_LOG_LEVEL_NAME})
+    resp.set_cookie(
+        "admin_token",
+        token,
+        max_age=86400,
+        httponly=True,
+        secure=False,
+        samesite="Lax",
+        path="/"
+    )
+    return resp
+
+
+@app.route('/api/tokens', methods=['GET', 'POST'])
+@require_admin
+def manage_tokens():
+    """获取或创建API访问Token"""
+    if request.method == 'GET':
+        return jsonify({"tokens": list(API_TOKENS)})
+    
+    data = request.json or {}
+    token = data.get("token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+    if not isinstance(token, str) or len(token) < 8:
+        return jsonify({"error": "Token格式不合法"}), 400
+    if token in API_TOKENS:
+        return jsonify({"error": "Token已存在"}), 400
+    
+    API_TOKENS.add(token)
+    persist_api_tokens()
+    return jsonify({"success": True, "token": token})
+
+
+@app.route('/api/tokens/<token>', methods=['DELETE'])
+@require_admin
+def delete_token(token):
+    """删除指定API Token"""
+    if token in API_TOKENS:
+        API_TOKENS.remove(token)
+        persist_api_tokens()
+        return jsonify({"success": True})
+    return jsonify({"error": "Token不存在"}), 404
+
+
 @app.route('/api/config/import', methods=['POST'])
+@require_admin
 def import_config():
     """导入配置"""
     try:
         data = request.json
         account_manager.config = data
+        if data.get("log_level"):
+            try:
+                set_log_level(data.get("log_level"), persist=False)
+            except Exception:
+                pass
+        if data.get("admin_secret_key"):
+            global ADMIN_SECRET_KEY
+            ADMIN_SECRET_KEY = data.get("admin_secret_key")
+        else:
+            get_admin_secret_key()
+        load_api_tokens()
         account_manager.accounts = data.get("accounts", [])
         # 重建账号状态
         account_manager.account_states = {}
@@ -1637,7 +2206,9 @@ def import_config():
                 "jwt": None,
                 "jwt_time": 0,
                 "session": None,
-                "available": available
+                "available": available,
+                "cooldown_until": acc.get("cooldown_until"),
+                "cooldown_reason": acc.get("unavailable_reason") or acc.get("cooldown_reason") or ""
             }
         account_manager.save_config()
         return jsonify({"success": True})
@@ -1646,6 +2217,7 @@ def import_config():
 
 
 @app.route('/api/proxy/test', methods=['POST'])
+@require_admin
 def test_proxy():
     """测试代理"""
     data = request.json
@@ -1662,6 +2234,7 @@ def test_proxy():
 
 
 @app.route('/api/proxy/status', methods=['GET'])
+@require_admin
 def get_proxy_status():
     """获取代理状态"""
     proxy = account_manager.config.get("proxy")
@@ -1677,6 +2250,7 @@ def get_proxy_status():
 
 
 @app.route('/api/config/export', methods=['GET'])
+@require_admin
 def export_config():
     """导出配置"""
     return jsonify(account_manager.config)
@@ -1700,6 +2274,7 @@ def print_startup_info():
     
     # 加载配置
     account_manager.load_config()
+    get_admin_secret_key()
     
     # 代理信息
     proxy = account_manager.config.get("proxy")
@@ -1721,9 +2296,16 @@ def print_startup_info():
     print(f"  可用数量: {available}")
     
     for i, acc in enumerate(account_manager.accounts):
-        status = "✓" if account_manager.account_states.get(i, {}).get("available", True) else "✗"
+        state = account_manager.account_states.get(i, {})
+        is_available = account_manager.is_account_available(i)
+        status = "✓" if is_available else "✗"
         team_id = acc.get("team_id", "未知") + "..."
-        print(f"  [{i}] {status} team_id: {team_id}")
+        cooldown_until = state.get("cooldown_until")
+        extra = ""
+        if cooldown_until and cooldown_until > time.time():
+            remaining = int(cooldown_until - time.time())
+            extra = f" (冷却中 ~{remaining}s)"
+        print(f"  [{i}] {status} team_id: {team_id}{extra}")
     
     # 模型信息
     models = account_manager.config.get("models", [])

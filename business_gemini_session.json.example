@@ -1,6 +1,12 @@
 {
     "proxy": "http://127.0.0.1:7890",
 	"image_base_url": "http://127.0.0.1:8000/",
+    "log_level": "INFO",
+    "admin_password_hash": "",
+    "admin_secret_key": "",
+    "api_tokens": [
+        "please_set_api_token_here"
+    ],
     "accounts": [
     ],
     "models": [
