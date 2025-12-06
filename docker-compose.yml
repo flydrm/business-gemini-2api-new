@@ -1,9 +1,9 @@
-name: business-gemini-pool
+name: business-gemini-new
 
 services:
   app:
     build: .
-    container_name: business-gemini-pool
+    container_name: business-gemini-new
     restart: unless-stopped
     ports:
       - "8000:8000"
@@ -14,7 +14,7 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
+      test: [ "CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)" ]
       interval: 30s
       timeout: 10s
       retries: 3

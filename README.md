@@ -1,6 +1,6 @@
 # Business Gemini Pool 管理系统
 
-一个基于 Flask 的 Google Gemini Enterprise API 代理服务，支持多账号轮训、OpenAI 兼容接口和 Web 管理控制台。
+一个基于 Flask 的 Google Gemini Enterprise API 代理服务，支持多账号轮训、OpenAI 兼容接口和 Web 管理控制台。修复了cookie添加过期问题
 
 ## 项目结构
 
