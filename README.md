@@ -1,12 +1,10 @@
 # Business Gemini Pool 管理系统
 
-> **Note**  
-> 本项目基于 [https://github.com/ddcat666/business-gemini-pool](https://github.com/ddcat666/business-gemini-pool) 进行开发和优化。
 
 一个基于 Flask 的 Google Gemini Enterprise API 代理服务，支持多账号轮训、OpenAI 兼容接口和 Web 管理控制台。修复了cookie添加过期问题
 
-# Note
-本项目基于 https://github.com/ddcat666/business-gemini-pool 进行开发和优化。
+> **Note**  
+> 本项目基于 [https://github.com/ddcat666/business-gemini-pool](https://github.com/ddcat666/business-gemini-pool) 进行开发和优化。
 
 ## 项目结构
 
