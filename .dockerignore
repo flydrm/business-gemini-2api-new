@@ -18,4 +18,3 @@ Thumbs.db
 docker-compose.yml
 Dockerfile
 .dockerignore
-business_gemini_session.json
