@@ -26,6 +26,7 @@ from flask import Flask, request, Response, jsonify, send_from_directory, abort
 from flask_cors import CORS
 from functools import wraps
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.exceptions import ClientDisconnected
 
 # 禁用SSL警告
 import urllib3
@@ -52,6 +53,12 @@ AUTH_ERROR_COOLDOWN_SECONDS = 900      # 凭证错误，15分钟
 RATE_LIMIT_COOLDOWN_SECONDS = 300      # 触发限额，5分钟
 GENERIC_ERROR_COOLDOWN_SECONDS = 120   # 其他错误的短暂冷却
 LOG_LEVELS = {"DEBUG": 10, "INFO": 20, "ERROR": 40}
+METRICS = {
+    "missing_ignore_total": 0,
+    "missing_retry_success": 0,
+    "missing_retry_failed": 0
+}
+METRICS_LOCK = threading.Lock()
 DEFAULT_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 CURRENT_LOG_LEVEL_NAME = DEFAULT_LOG_LEVEL if DEFAULT_LOG_LEVEL in LOG_LEVELS else "INFO"
 CURRENT_LOG_LEVEL = LOG_LEVELS[CURRENT_LOG_LEVEL_NAME]
@@ -437,7 +444,8 @@ class FileManager:
         self.files: Dict[str, Dict] = {}  # openai_file_id -> {gemini_file_id, session_name, filename, mime_type, size, created_at}
     
     def add_file(self, openai_file_id: str, gemini_file_id: str, session_name: str, 
-                 filename: str, mime_type: str, size: int) -> Dict:
+                 filename: str, mime_type: str, size: int,
+                 account_idx: Optional[int] = None, team_id: Optional[str] = None) -> Dict:
         """添加文件映射"""
         file_info = {
             "id": openai_file_id,
@@ -448,7 +456,9 @@ class FileManager:
             "bytes": size,
             "created_at": int(time.time()),
             "purpose": "assistants",
-            "object": "file"
+            "object": "file",
+            "account_idx": account_idx,
+            "team_id": team_id
         }
         self.files[openai_file_id] = file_info
         return file_info
@@ -468,6 +478,14 @@ class FileManager:
             del self.files[openai_file_id]
             return True
         return False
+    
+    def mark_file_invalid(self, openai_file_id: str):
+        """标记或删除失效文件映射"""
+        if INVALID_FILE_POLICY_DELETE:
+            self.delete_file(openai_file_id)
+        else:
+            if openai_file_id in self.files:
+                self.files[openai_file_id]["invalid"] = True
     
     def list_files(self) -> List[Dict]:
         """列出所有文件"""
@@ -734,6 +752,21 @@ def raise_for_account_response(resp: requests.Response, action: str):
         raise AccountRateLimitError(f"{action} 触发限额: {status} - {body_preview}", status)
 
     raise AccountRequestError(f"{action} 请求失败: {status} - {body_preview}", status)
+
+
+def is_file_not_found_error(err: Exception) -> bool:
+    """检测 Gemini 返回的文件不存在错误"""
+    if not isinstance(err, AccountRequestError):
+        return False
+    status = getattr(err, "status_code", None)
+    msg = str(err).lower()
+    return status == 404 and ("file with id" in msg or "file_not_found" in msg or "file not found" in msg)
+
+
+def inc_metric(name: str):
+    if name in METRICS:
+        with METRICS_LOCK:
+            METRICS[name] += 1
 
 
 def ensure_jwt_for_account(account_idx: int, account: dict):
@@ -1749,7 +1782,9 @@ def upload_file():
                         session_name=session,
                         filename=file.filename,
                         mime_type=mime_type,
-                        size=len(file_content)
+                        size=len(file_content),
+                        account_idx=account_idx,
+                        team_id=team_id
                     )
                     print(f"[文件上传] 步骤4完成: openai_file_id={openai_file_id}, 耗时={time.time()-step_start:.3f}秒")
                     
@@ -1884,7 +1919,12 @@ def chat_completions():
         # 每次请求时清理过期图片
         cleanup_expired_images()
         
-        data = request.json
+        try:
+            data = request.get_json(silent=True) or {}
+        except ClientDisconnected:
+            return jsonify({"error": "客户端已中断连接"}), 499
+        if not isinstance(data, dict) or not data:
+            return jsonify({"error": "请求体不是有效的 JSON 对象"}), 400
         messages = data.get('messages', [])
         prompts = data.get('prompts', [])  # 支持替代格式
         stream = data.get('stream', False)
@@ -1944,12 +1984,58 @@ def chat_completions():
                     images_from_files = extract_images_from_files_array(files_array)
                     input_images.extend(images_from_files)
         
-        # 将 OpenAI file_id 转换为 Gemini fileId
+        # 将 OpenAI file_id 转换为 Gemini fileId，缺失则忽略并记录
         gemini_file_ids = []
+        used_openai_file_ids = []
+        ignored_file_ids = []
+        target_account_idx = None
+        target_session = None
+        target_team_id = None
         for fid in input_file_ids:
-            gemini_fid = file_manager.get_gemini_file_id(fid)
-            if gemini_fid:
-                gemini_file_ids.append(gemini_fid)
+            finfo = file_manager.get_file(fid)
+            if not finfo or not finfo.get("gemini_file_id") or finfo.get("invalid"):
+                ignored_file_ids.append(fid)
+                inc_metric("missing_ignore_total")
+                if finfo and INVALID_FILE_POLICY_DELETE:
+                    file_manager.mark_file_invalid(fid)
+                continue
+
+            acc_idx = finfo.get("account_idx")
+            if acc_idx is not None:
+                if target_account_idx is None:
+                    target_account_idx = acc_idx
+                elif target_account_idx != acc_idx:
+                    ignored_file_ids.append(fid)
+                    inc_metric("missing_ignore_total")
+                    continue
+
+            sess_name = finfo.get("session_name")
+            if sess_name:
+                if target_session is None:
+                    target_session = sess_name
+                elif target_session != sess_name:
+                    ignored_file_ids.append(fid)
+                    inc_metric("missing_ignore_total")
+                    continue
+
+            team_id_from_file = finfo.get("team_id")
+            if team_id_from_file:
+                if target_team_id is None:
+                    target_team_id = team_id_from_file
+                elif target_team_id != team_id_from_file:
+                    ignored_file_ids.append(fid)
+                    inc_metric("missing_ignore_total")
+                    continue
+
+            gemini_fid = finfo.get("gemini_file_id")
+            gemini_file_ids.append(gemini_fid)
+            used_openai_file_ids.append(fid)
+        if ignored_file_ids:
+            print(json.dumps({
+                "event": "file_ignored",
+                "file_ids": ignored_file_ids,
+                "reason": "missing_or_conflict"
+            }))
         
         if not user_message and not input_images and not gemini_file_ids:
             return jsonify({"error": "No user message found"}), 400
@@ -1965,6 +2051,8 @@ def chat_completions():
                 accounts = account_manager.accounts
                 if specified_account_id < 0 or specified_account_id >= len(accounts):
                     return jsonify({"error": f"无效的账号ID: {specified_account_id}"}), 400
+                if target_account_idx is not None and target_account_idx != specified_account_id:
+                    return jsonify({"error": "请求的账号与文件所属账号不一致"}), 400
                 account = accounts[specified_account_id]
                 if not account.get('enabled', True):
                     return jsonify({"error": f"账号 {specified_account_id} 已禁用"}), 400
@@ -1973,18 +2061,33 @@ def chat_completions():
                     return jsonify({"error": f"账号 {specified_account_id} 正在冷却中，请稍后重试"}), 429
                 account_idx = specified_account_id
             else:
-                # 轮训获取账号
-                available_accounts = account_manager.get_available_accounts()
-                if not available_accounts:
-                    next_cd = account_manager.get_next_cooldown_info()
-                    wait_msg = ""
-                    if next_cd:
-                        wait_msg = f"（最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
-                    return jsonify({"error": f"没有可用的账号{wait_msg}"}), 429
-                account_idx, account = account_manager.get_next_account()
+                # 如果文件绑定了账号，则优先使用该账号
+                if target_account_idx is not None:
+                    if target_account_idx < 0 or target_account_idx >= len(account_manager.accounts):
+                        return jsonify({"error": "文件关联的账号不存在或已被删除"}), 400
+                    account_idx = target_account_idx
+                    account = account_manager.accounts[account_idx]
+                    if not account_manager.is_account_available(account_idx):
+                        return jsonify({"error": f"文件所属账号 {account_idx} 当前不可用或在冷却中"}), 429
+                else:
+                    # 轮训获取账号
+                    available_accounts = account_manager.get_available_accounts()
+                    if not available_accounts:
+                        next_cd = account_manager.get_next_cooldown_info()
+                        wait_msg = ""
+                        if next_cd:
+                            wait_msg = f"（最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
+                        return jsonify({"error": f"没有可用的账号{wait_msg}"}), 429
+                    account_idx, account = account_manager.get_next_account()
             
             try:
-                session, jwt, team_id = ensure_session_for_account(account_idx, account)
+                if target_session:
+                    jwt = ensure_jwt_for_account(account_idx, account)
+                    session = target_session
+                    team_id = target_team_id or account.get("team_id")
+                    account_manager.account_states[account_idx]["session"] = session
+                else:
+                    session, jwt, team_id = ensure_session_for_account(account_idx, account)
                 proxy = get_proxy()
                 
                 # 上传内联图片获取 fileId
@@ -1996,22 +2099,83 @@ def chat_completions():
                 # 获取账号标识
                 used_account_csesidx = account.get('csesidx', f'账号{account_idx}')
                 
-                # 真正的流式响应
+                # 真正的流式响应，文件缺失时单次重试（同账号同会话，不带文件），并捕获其他异常
                 def generate_stream():
-                    for chunk in stream_chat_realtime(
-                        jwt, session, user_message, proxy, team_id, 
-                        gemini_file_ids, account, used_account_csesidx,
-                        model_name=requested_model,
-                        model_id=model_id,
-                        include_thought=include_thought
-                    ):
-                        yield chunk
+                    def stream_once(file_ids: List[str]):
+                        return stream_chat_realtime(
+                            jwt, session, user_message, proxy, team_id,
+                            file_ids, account, used_account_csesidx,
+                            model_name=requested_model,
+                            model_id=model_id,
+                            include_thought=include_thought
+                        )
+
+                    meta_ids = list(dict.fromkeys(ignored_file_ids))
+                    if meta_ids:
+                        meta_chunk = {"event": "meta", "ignored_file_ids": meta_ids}
+                        yield f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n"
+
+                    try:
+                        yield from stream_once(gemini_file_ids)
+                    except AccountRequestError as e:
+                        if not (is_file_not_found_error(e) and gemini_file_ids):
+                            print(json.dumps({
+                                "event": "stream_error",
+                                "type": type(e).__name__,
+                                "error": str(e),
+                                "account_id": account_idx
+                            }))
+                            account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+                            error_chunk = {"event": "error", "message": str(e)}
+                            yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                            return
+                        for fid in used_openai_file_ids:
+                            file_manager.mark_file_invalid(fid)
+                        ignored_file_ids.extend([fid for fid in used_openai_file_ids if fid not in ignored_file_ids])
+                        # 推送最新忽略列表
+                        if ignored_file_ids:
+                            meta_chunk = {"event": "meta", "ignored_file_ids": list(dict.fromkeys(ignored_file_ids))}
+                            yield f"data: {json.dumps(meta_chunk, ensure_ascii=False)}\n\n"
+                        try:
+                            yield from stream_once([])
+                            inc_metric("missing_retry_success")
+                            print(json.dumps({
+                                "event": "file_retry",
+                                "result": "success",
+                                "file_ids": used_openai_file_ids,
+                                "account_id": account_idx
+                            }))
+                        except Exception as retry_e:
+                            inc_metric("missing_retry_failed")
+                            print(json.dumps({
+                                "event": "file_retry",
+                                "result": "failed",
+                                "file_ids": used_openai_file_ids,
+                                "account_id": account_idx,
+                                "error": str(retry_e)
+                            }))
+                            account_manager.mark_account_cooldown(account_idx, str(retry_e), account_manager.generic_error_cooldown)
+                            raise retry_e
+                    except Exception as e:
+                        print(json.dumps({
+                            "event": "stream_error",
+                            "type": type(e).__name__,
+                            "error": str(e),
+                            "account_id": account_idx
+                        }))
+                        account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+                        # 输出 error 事件后中断推流
+                        error_chunk = {"event": "error", "message": str(e)}
+                        yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+                        return
                 
                 # 创建响应并设置必要的头部禁用缓冲
                 response = Response(generate_stream(), mimetype='text/event-stream')
                 response.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
                 response.headers['X-Accel-Buffering'] = 'no'  # 禁用 nginx 缓冲
                 response.headers['Connection'] = 'keep-alive'
+                if ignored_file_ids:
+                    response.headers['X-Ignored-File-Ids'] = ",".join(ignored_file_ids)
                 return response
                 
             except (AccountRateLimitError, AccountAuthError, AccountRequestError) as e:
@@ -2026,6 +2190,8 @@ def chat_completions():
             accounts = account_manager.accounts
             if specified_account_id < 0 or specified_account_id >= len(accounts):
                 return jsonify({"error": f"无效的账号ID: {specified_account_id}"}), 400
+            if target_account_idx is not None and target_account_idx != specified_account_id:
+                return jsonify({"error": "请求的账号与文件所属账号不一致"}), 400
             account = accounts[specified_account_id]
             if not account.get('enabled', True):
                 return jsonify({"error": f"账号 {specified_account_id} 已禁用"}), 400
@@ -2039,64 +2205,154 @@ def chat_completions():
             chat_response = None
             account_idx = specified_account_id
             try:
-                session, jwt, team_id = ensure_session_for_account(account_idx, account)
-                proxy = get_proxy()
-                
-                for img in input_images:
-                    uploaded_file_id = upload_inline_image_to_gemini(jwt, session, team_id, img, proxy)
-                    if uploaded_file_id:
-                        gemini_file_ids.append(uploaded_file_id)
-                
-                chat_response = stream_chat_with_images(jwt, session, user_message, proxy, team_id, gemini_file_ids, account, model_id=model_id, include_thought=include_thought)
+                def run_chat(current_file_ids: List[str]):
+                    if target_session:
+                        jwt_local = ensure_jwt_for_account(account_idx, account)
+                        session_local = target_session
+                        team_id_local = target_team_id or account.get("team_id")
+                        account_manager.account_states[account_idx]["session"] = session_local
+                    else:
+                        session_local, jwt_local, team_id_local = ensure_session_for_account(account_idx, account)
+                    proxy_local = get_proxy()
+                    upload_ids = list(current_file_ids)
+                    for img in input_images:
+                        uploaded_file_id = upload_inline_image_to_gemini(jwt_local, session_local, team_id_local, img, proxy_local)
+                        if uploaded_file_id:
+                            upload_ids.append(uploaded_file_id)
+                    return stream_chat_with_images(jwt_local, session_local, user_message, proxy_local, team_id_local, upload_ids, account, model_id=model_id, include_thought=include_thought)
+
+                chat_response = run_chat(gemini_file_ids)
             except (AccountRateLimitError, AccountAuthError, AccountRequestError) as e:
-                last_error = e
-                account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
+                if isinstance(e, AccountRequestError) and is_file_not_found_error(e) and gemini_file_ids:
+                    for fid in used_openai_file_ids:
+                        file_manager.mark_file_invalid(fid)
+                    ignored_file_ids.extend([fid for fid in used_openai_file_ids if fid not in ignored_file_ids])
+                    try:
+                        chat_response = run_chat([])
+                        inc_metric("missing_retry_success")
+                        print(json.dumps({
+                            "event": "file_retry",
+                            "result": "success",
+                            "file_ids": used_openai_file_ids,
+                            "account_id": account_idx
+                        }))
+                        last_error = None
+                    except Exception as retry_e:
+                        last_error = retry_e
+                        inc_metric("missing_retry_failed")
+                        print(json.dumps({
+                            "event": "file_retry",
+                            "result": "failed",
+                            "file_ids": used_openai_file_ids,
+                            "account_id": account_idx,
+                            "error": str(retry_e)
+                        }))
+                else:
+                    last_error = e
+                    account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
             except Exception as e:
                 last_error = e
         else:
             # 轮训获取账号
-            available_accounts = account_manager.get_available_accounts()
-            if not available_accounts:
-                next_cd = account_manager.get_next_cooldown_info()
-                wait_msg = ""
-                if next_cd:
-                    wait_msg = f"（最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
-                return jsonify({"error": f"没有可用的账号{wait_msg}"}), 429
+            # 如果文件绑定了账号，则固定该账号；否则轮训
+            if target_account_idx is not None:
+                if target_account_idx < 0 or target_account_idx >= len(account_manager.accounts):
+                    return jsonify({"error": "文件关联的账号不存在或已被删除"}), 400
+                if not account_manager.is_account_available(target_account_idx):
+                    return jsonify({"error": f"文件所属账号 {target_account_idx} 当前不可用或在冷却中"}), 429
 
-            max_retries = len(available_accounts)
-            last_error = None
-            chat_response = None
-            
-            for retry_idx in range(max_retries):
-                account_idx = None
+                last_error = None
+                chat_response = None
+                account_idx = target_account_idx
+                account = account_manager.accounts[account_idx]
                 try:
-                    account_idx, account = account_manager.get_next_account()
-                    session, jwt, team_id = ensure_session_for_account(account_idx, account)
+                    if target_session:
+                        jwt = ensure_jwt_for_account(account_idx, account)
+                        session = target_session
+                        team_id = target_team_id or account.get("team_id")
+                        account_manager.account_states[account_idx]["session"] = session
+                    else:
+                        session, jwt, team_id = ensure_session_for_account(account_idx, account)
                     proxy = get_proxy()
-                    
-                    # 上传内联图片获取 fileId
+
                     for img in input_images:
                         uploaded_file_id = upload_inline_image_to_gemini(jwt, session, team_id, img, proxy)
                         if uploaded_file_id:
                             gemini_file_ids.append(uploaded_file_id)
-                    
+
                     chat_response = stream_chat_with_images(jwt, session, user_message, proxy, team_id, gemini_file_ids, account, model_id=model_id, include_thought=include_thought)
+                except Exception as e:
+                    last_error = e
+            else:
+                available_accounts = account_manager.get_available_accounts()
+                if not available_accounts:
+                    next_cd = account_manager.get_next_cooldown_info()
+                    wait_msg = ""
+                    if next_cd:
+                        wait_msg = f"（最近冷却账号 {next_cd['index']}，约 {int(next_cd['cooldown_until']-time.time())} 秒后可重试）"
+                    return jsonify({"error": f"没有可用的账号{wait_msg}"}), 429
+
+                max_retries = len(available_accounts)
+                last_error = None
+                chat_response = None
+                
+            for retry_idx in range(max_retries):
+                account_idx = None
+                try:
+                    account_idx, account = account_manager.get_next_account()
+                    def run_chat(current_file_ids: List[str]):
+                        session_local, jwt_local, team_id_local = ensure_session_for_account(account_idx, account)
+                        proxy_local = get_proxy()
+                        upload_ids = list(current_file_ids)
+                        for img in input_images:
+                            uploaded_file_id = upload_inline_image_to_gemini(jwt_local, session_local, team_id_local, img, proxy_local)
+                            if uploaded_file_id:
+                                upload_ids.append(uploaded_file_id)
+                        return stream_chat_with_images(jwt_local, session_local, user_message, proxy_local, team_id_local, upload_ids, account, model_id=model_id, include_thought=include_thought)
+
+                    chat_response = run_chat(gemini_file_ids)
                     break
                 except AccountRateLimitError as e:
                     last_error = e
                     if account_idx is not None:
                         pt_wait = seconds_until_next_pt_midnight()
-                        cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
-                        account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
-                    print(f"[聊天] 第{retry_idx+1}次尝试失败(限额): {e}")
-                    continue
-                except AccountAuthError as e:
-                    last_error = e
-                    if account_idx is not None:
-                        account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
+                            cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+                            account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
+                        print(f"[聊天] 第{retry_idx+1}次尝试失败(限额): {e}")
+                        continue
+                    except AccountAuthError as e:
+                        last_error = e
+                        if account_idx is not None:
+                            account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
                     print(f"[聊天] 第{retry_idx+1}次尝试失败(凭证): {e}")
                     continue
                 except AccountRequestError as e:
+                    if is_file_not_found_error(e) and gemini_file_ids:
+                        for fid in used_openai_file_ids:
+                            file_manager.mark_file_invalid(fid)
+                        ignored_file_ids.extend([fid for fid in used_openai_file_ids if fid not in ignored_file_ids])
+                        try:
+                            chat_response = run_chat([])
+                            inc_metric("missing_retry_success")
+                            print(json.dumps({
+                                "event": "file_retry",
+                                "result": "success",
+                                "file_ids": used_openai_file_ids,
+                                "account_id": account_idx
+                            }))
+                            last_error = None
+                            break
+                        except Exception as retry_e:
+                            last_error = retry_e
+                            inc_metric("missing_retry_failed")
+                            print(json.dumps({
+                                "event": "file_retry",
+                                "result": "failed",
+                                "file_ids": used_openai_file_ids,
+                                "account_id": account_idx,
+                                "error": str(retry_e)
+                            }))
+                            break
                     last_error = e
                     if account_idx is not None:
                         account_manager.mark_account_cooldown(account_idx, str(e), account_manager.generic_error_cooldown)
@@ -2107,9 +2363,11 @@ def chat_completions():
                     print(f"[聊天] 第{retry_idx+1}次尝试失败: {type(e).__name__}: {e}")
                     if account_idx is None:
                         break
-                    continue
+                        continue
         
         if chat_response is None:
+            if is_file_not_found_error(last_error):
+                return jsonify({"error": "引用的文件不存在或已过期，请重新上传或重新绑定 file_id"}), 400
             error_message = last_error or "没有可用的账号"
             status_code = 429 if isinstance(last_error, (AccountRateLimitError, NoAvailableAccount)) else 500
             return jsonify({"error": f"所有账号请求失败: {error_message}"}), status_code
@@ -2144,6 +2402,8 @@ def chat_completions():
                 "total_tokens": len(user_message) + len(chat_response.text)
             }
         }
+        if ignored_file_ids:
+            response["ignored_file_ids"] = ignored_file_ids
         return jsonify(response)
 
     except Exception as e:
@@ -2823,3 +3083,5 @@ if __name__ == '__main__':
         print("[!] 警告: 没有配置任何账号")
     
     app.run(host='0.0.0.0', port=8000, debug=False)
+# 缺失文件策略：缺失即删除映射，并继续生成
+INVALID_FILE_POLICY_DELETE = True
