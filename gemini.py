@@ -2316,14 +2316,14 @@ def chat_completions():
                     last_error = e
                     if account_idx is not None:
                         pt_wait = seconds_until_next_pt_midnight()
-                            cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
-                            account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
-                        print(f"[聊天] 第{retry_idx+1}次尝试失败(限额): {e}")
-                        continue
-                    except AccountAuthError as e:
-                        last_error = e
-                        if account_idx is not None:
-                            account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
+                        cooldown_seconds = max(account_manager.rate_limit_cooldown, pt_wait)
+                        account_manager.mark_account_cooldown(account_idx, str(e), cooldown_seconds)
+                    print(f"[聊天] 第{retry_idx+1}次尝试失败(限额): {e}")
+                    continue
+                except AccountAuthError as e:
+                    last_error = e
+                    if account_idx is not None:
+                        account_manager.mark_account_cooldown(account_idx, str(e), account_manager.auth_error_cooldown)
                     print(f"[聊天] 第{retry_idx+1}次尝试失败(凭证): {e}")
                     continue
                 except AccountRequestError as e:
